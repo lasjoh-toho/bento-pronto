@@ -1419,7 +1419,7 @@ async function parsePastedContent(html, plain, imageFiles, imgStats){
         if (!src) continue;
         imgStats.found++;
         const dataUrl = await tryFetchImageAsDataUrl(src);
-        if (dataUrl){ imgStats.embedded++; blocks.push({ id: newBlockId(), kind: 'image', dataUrl }); }
+        if (dataUrl){ imgStats.embedded++; blocks.push({ id: newBlockId(), kind: 'image', dataUrl, sourceUrl: src, retrievedAt: new Date().toISOString().slice(0, 10) }); }
         continue;
       }
       // skip a node whose text is fully covered by a nested node we'll
@@ -1521,6 +1521,8 @@ function buildInitialDoc(blocks){
       const img = document.createElement('img');
       img.src = b.dataUrl;
       img.dataset.lr = 'image';
+      if (b.sourceUrl) img.dataset.sourceUrl = b.sourceUrl;
+      if (b.retrievedAt) img.dataset.retrievedAt = b.retrievedAt;
       lrDoc.appendChild(img);
     } else if (b.html) {
       const p = document.createElement('p');
@@ -1714,7 +1716,10 @@ function parseDocToBlocks(){
     if (node.dataset.lrMarker === 'zusatz-on'){ inZusatz = true; continue; }
     if (node.dataset.lrMarker === 'zusatz-off'){ inZusatz = false; continue; }
     if (node.dataset.lr === 'image'){
-      blocks.push({ kind: 'image', dataUrl: node.getAttribute('src'), slideBreakBefore: pendingBreak });
+      blocks.push({
+        kind: 'image', dataUrl: node.getAttribute('src'), slideBreakBefore: pendingBreak,
+        sourceUrl: node.dataset.sourceUrl, retrievedAt: node.dataset.retrievedAt,
+      });
     } else {
       const text = (node.textContent || '').trim();
       if (text) blocks.push({ kind: 'text', role: inZusatz ? 'longread' : 'slide', text, slideBreakBefore: pendingBreak });
@@ -1750,10 +1755,14 @@ function buildDocFromBlocks(blocks){
   for (const block of blocks){
     if (block.slideBreakBefore || !current) startSlide();
     if (block.kind === 'image'){
-      current.elements.push({
+      const imageEl = {
         id: uuid(), type: 'image', x: 240, y: 160, w: 800, h: 450, rotation: 0, opacity: 1,
         src: internImage(block.dataUrl), fit: 'contain', radius: 0,
-      });
+      };
+      if (block.sourceUrl) {
+        imageEl.citation = { sourceUrl: block.sourceUrl, retrievedAt: block.retrievedAt || new Date().toISOString().slice(0, 10) };
+      }
+      current.elements.push(imageEl);
       continue;
     }
     const text = block.text.trim();
