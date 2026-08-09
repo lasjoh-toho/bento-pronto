@@ -22,6 +22,17 @@
  */
 
 if (isset($_GET['proxy'])) {
+    // Disabled by default — set to 'yes' to re-enable. Everything below
+    // this still works exactly as before; this switch is the only thing
+    // standing between a request and it.
+    $proxy = 'no';
+    if ($proxy !== 'yes') {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Image proxy is currently disabled.';
+        exit;
+    }
+
     header('Access-Control-Allow-Origin: *');
     header('Access-Control-Allow-Methods: GET');
 
