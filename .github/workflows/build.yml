@@ -1,0 +1,51 @@
+name: Build & release bento-pronto.php
+
+# Manual only, on purpose — a build pulls whatever is CURRENTLY on the bento
+# fork's branch (see build.mjs), so triggering it is a deliberate "release
+# now" action, not something that should fire on every unrelated push here.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # The whole point: if the bento fork doesn't clone, doesn't install,
+      # doesn't typecheck, or doesn't build — this step exits non-zero and
+      # the job stops HERE. Nothing past this point runs, so no release is
+      # created. Whatever was released before stays the latest release,
+      # untouched.
+      - name: Build bento-pronto.php from the bento fork
+        run: node build.mjs
+
+      - name: Verify the build actually produced a real, fully-spliced file
+        run: |
+          test -s dist/bento-pronto.php
+          grep -q 'bento-shell-b64' dist/bento-pronto.php
+          ! grep -q '__BENTO_' dist/bento-pronto.php
+          php -l dist/bento-pronto.php
+
+      - name: Tag and release
+        id: tag
+        run: echo "tag=v$(date -u +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: bento-pronto ${{ steps.tag.outputs.tag }}
+          body: |
+            Self-hosted, single-file PHP version of the PPTX→Bento converter
+            — download `bento-pronto.php` below and drop it on any
+            PHP-capable web server. Built fresh from the current bento
+            source on every release (see build.mjs), so it always ships
+            with the latest editor/present-mode fixes.
+          files: dist/bento-pronto.php
