@@ -78,6 +78,12 @@ $modules = array_values(array_filter($meta['modules'] ?? [], fn($m) => in_array(
 <?php if (!$modules): ?>
   <p class="hub-muted">Für diese Ansicht ist aktuell kein Modul freigegeben.</p>
 <?php else: ?>
+  <?php if (count($modules) > 1): ?>
+  <div class="hub-card">
+    <a class="hub-btn hub-primary" href="module.php?slug=<?= urlencode($slug) ?>&file=<?= urlencode($modules[0]['file']) ?>&as=<?= urlencode($tier) ?>&chain=1" target="_blank" rel="noopener">▶ Ganze Präsentation starten (<?= count($modules) ?> Module)</a>
+    <p class="hub-muted" style="margin:8px 0 0">Springt automatisch von einem Modul zum nächsten, sobald die letzte Folie erreicht ist.</p>
+  </div>
+  <?php endif; ?>
   <div class="hub-card">
     <table>
       <thead><tr><th>#</th><th>Titel</th><th></th></tr></thead>
@@ -89,7 +95,7 @@ $modules = array_values(array_filter($meta['modules'] ?? [], fn($m) => in_array(
             <?= bento_hub_e($m['title'] ?? $m['file']) ?>
             <?php if ((int) $m['visibility'] === BENTO_HUB_VIS_MODERATOR): ?><span class="hub-pill mod">Moderator</span><?php endif; ?>
           </td>
-          <td><a class="hub-btn hub-primary" href="module.php?slug=<?= urlencode($slug) ?>&file=<?= urlencode($m['file']) ?>&as=<?= urlencode($tier) ?>" target="_blank" rel="noopener">Präsentation starten</a></td>
+          <td><a class="hub-btn" href="module.php?slug=<?= urlencode($slug) ?>&file=<?= urlencode($m['file']) ?>&as=<?= urlencode($tier) ?>" target="_blank" rel="noopener">Einzeln öffnen</a></td>
         </tr>
       <?php endforeach; ?>
       </tbody>

@@ -12,12 +12,25 @@
  * Deliberately its own plain GET endpoint, not routed through play.php's
  * page chrome — a module is a full standalone HTML document (its own
  * <html>/<head>/<body>, the whole embedded Bento app), so it can't be
- * included inside another page; this always the top-level response.
- * Mirrors moodle-mod_bento's deck.php in spirit (same visibility check,
- * same "not a general read-any-content endpoint" reasoning) even though
- * the transport differs (deck.php returns raw JSON to an already-loaded
- * app; this returns a complete standalone HTML file since that's the
- * whole storage unit here).
+ * included inside another page; this always the top-level response
+ * (except ?raw=1, see below).
+ *
+ * Two extra query params, both opt-in and both still going through the
+ * exact same authorization check above:
+ *
+ * - ?raw=1 — returns just the module's #bento-doc JSON (not the wrapped
+ *   HTML page). Mirrors moodle-mod_bento's own deck.php, which serves the
+ *   same shape for the same reason: this is what Bento's present-mode
+ *   auto-advance fetches (see bento's editor/playlist.ts — a generic,
+ *   non-Moodle-specific `<meta name="bento-playlist">` opt-in) once it
+ *   reaches the end of the PREVIOUS module in a chain.
+ * - ?chain=1 — only meaningful on the normal (non-raw) HTML response:
+ *   injects that same <meta name="bento-playlist"> tag, listing every
+ *   OTHER module visible at this tier (in stored order) as ?raw=1 URLs.
+ *   play.php's "Ganze Präsentation starten" button is the only place that
+ *   sets this — a module's own standalone/direct link never does, so
+ *   sharing ONE module link keeps behaving like sharing just that one
+ *   module, not the whole presentation.
  */
 
 declare(strict_types=1);
@@ -67,12 +80,43 @@ if ($html === false) {
     exit;
 }
 
+$raw = (string) ($_GET['raw'] ?? '') === '1';
+
+if ($raw) {
+    $json = bento_hub_extract_doc_json($html);
+    if ($json === null) {
+        http_response_code(500);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Modul enthält kein gültiges bento/slides-Dokument.';
+        exit;
+    }
+    header('Content-Type: application/json; charset=utf-8');
+    header('X-Frame-Options: SAMEORIGIN');
+    echo $json;
+    exit;
+}
+
+$headInject = '<script>location.hash = "present";</script>';
+
+if ((string) ($_GET['chain'] ?? '') === '1') {
+    $base = (str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME']))) . '/';
+    $items = [];
+    foreach ($meta['modules'] ?? [] as $m) {
+        if ($m['file'] === $file) continue; // never chain into itself
+        if (!in_array((int) ($m['visibility'] ?? 0), $allowedForTier, true)) continue;
+        $items[] = ['url' => $base . 'module.php?slug=' . urlencode($slug) . '&file=' . urlencode($m['file']) . '&as=' . urlencode($tier) . '&raw=1'];
+    }
+    if ($items) {
+        $content = htmlspecialchars(json_encode(['items' => $items], JSON_UNESCAPED_SLASHES), ENT_QUOTES, 'UTF-8');
+        $headInject .= '<meta name="bento-playlist" content="' . $content . '">';
+    }
+}
+
 // Auto-launch present mode, same trick view.php uses in moodle-mod_bento
 // (main.ts checks location.hash === '#present' once its bundle runs) —
 // injected right after <head> so it runs before the (much larger) app
 // bundle further down even parses.
-$bootstrap = '<script>location.hash = "present";</script>';
-$html = preg_replace('/<head[^>]*>/', '$0' . $bootstrap, $html, 1) ?? $html;
+$html = preg_replace('/<head[^>]*>/', '$0' . $headInject, $html, 1) ?? $html;
 
 header('Content-Type: text/html; charset=utf-8');
 header('X-Frame-Options: SAMEORIGIN');

@@ -178,6 +178,15 @@ function bento_hub_extract_title(string $html, string $fallback): string {
     return $fallback;
 }
 
+/** Raw #bento-doc JSON string from a module's HTML, or null if none is found. */
+function bento_hub_extract_doc_json(string $html): ?string {
+    if (preg_match('/<script[^>]*id=["\']bento-doc["\'][^>]*>([\s\S]*?)<\/script>/', $html, $m)) {
+        $json = trim($m[1]);
+        return json_decode($json) !== null ? $json : null;
+    }
+    return null;
+}
+
 function bento_hub_visibility_label(int $v): string {
     return match ($v) {
         BENTO_HUB_VIS_PUBLIC => 'Öffentlich',

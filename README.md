@@ -45,12 +45,15 @@ link:
 `hub/config.php` and `hub/data/` (where presentations/modules actually live)
 are gitignored — never commit either.
 
-**Known limitation:** each module is its own fully standalone HTML document,
-so reaching the last slide of one module does **not** auto-advance into the
-next one the way `mod_bento`'s own Moodle-hosted decks can (that relies on a
-present-mode playlist hook that only activates inside a real Moodle URL). The
-public/moderator link is itself the navigation between modules for now —
-presenters click back to it between decks.
+**Auto-advance between modules** ("Ganze Präsentation starten" on the public/
+moderator link, shown once a presentation has more than one module): reaching
+the last slide of one module auto-loads the next, exactly like `mod_bento`'s
+own Moodle-hosted decks — via a *generic*, non-Moodle-specific present-mode
+playlist hook Bento core now exposes (`<meta name="bento-playlist">`, opt-in
+by presence alone, not by URL shape). This only works once a module was
+exported from a Bento build that carries that hook — a module `.bento.html`
+built before this existed won't respond to `?chain=1`, and just opens on its
+own, same as clicking a single module's own direct link always has.
 
 ## Security notes on the built-in proxy
 
