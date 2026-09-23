@@ -10,6 +10,48 @@ A self-hostable, **single PHP file** version of the [bento-moodle-tools](https:/
 2. Drop it on any PHP-capable web server (shared hosting, a VPS, alongside an existing Moodle install — anything that runs PHP with either the `curl` extension or plain `allow_url_fopen`, both common defaults).
 3. Open it in a browser. That's it — no database, no dependencies, no build step on your end.
 
+## The hub — a one-person presentation control center (`hub/`)
+
+`template.php` alone is a one-shot converter — open it, get one file out, done.
+`hub/` is a small standalone PHP app (no database, plain files) sitting on top
+of that idea: it organizes any number of **presentations**, each built from one
+or more **modules** — ordinary self-contained `.bento.html` files (saved
+straight from the Bento editor, or produced by `template.php`'s converter).
+
+Each module carries its own visibility, mirroring the exact three-state model
+[`mod_bento`](https://github.com/lasjoh-toho/moodle-mod_bento)'s own
+`bento_decks` table already uses: **hidden** (draft, admin preview only),
+**public**, or **moderator-only** (e.g. slides with answers/speaker notes that
+only the presenter should see). A presentation then exposes three kinds of
+link:
+
+- **one public link** — plays through every *public* module, for the audience;
+- **one moderator link** — public *and* moderator-only modules, for whoever is
+  presenting;
+- **one direct link per module** — for sharing a single slide deck on its own.
+
+### Setup
+
+1. Copy `hub/config.example.php` to `hub/config.php` and set an admin password:
+   ```
+   php -r "echo password_hash('DEIN-PASSWORT', PASSWORD_DEFAULT), \"\n\";"
+   ```
+2. Open `hub/index.php`, log in, create a presentation, upload modules.
+3. Optionally add a `public_password_hash`/`moderator_password_hash` per
+   presentation slug in `hub/config.php` to password-gate that presentation's
+   public/moderator links for outside visitors (the admin never needs these —
+   logging into the hub already unlocks everything).
+
+`hub/config.php` and `hub/data/` (where presentations/modules actually live)
+are gitignored — never commit either.
+
+**Known limitation:** each module is its own fully standalone HTML document,
+so reaching the last slide of one module does **not** auto-advance into the
+next one the way `mod_bento`'s own Moodle-hosted decks can (that relies on a
+present-mode playlist hook that only activates inside a real Moodle URL). The
+public/moderator link is itself the navigation between modules for now —
+presenters click back to it between decks.
+
 ## Security notes on the built-in proxy
 
 An "fetch any URL for me" endpoint is an abuse target if left wide open, so `?proxy=` includes:

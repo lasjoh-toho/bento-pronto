@@ -1,2 +1,5 @@
 dist/
 node_modules/
+hub/config.php
+hub/data/*
+!hub/data/.htaccess
