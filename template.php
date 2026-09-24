@@ -1,5 +1,362 @@
 <?php
 /**
+ * bento.php — bento-pronto (siehe README des bento-pronto-Projekts), fest in
+ * infomaster eingebaut: gleiche Login-Session wie infomaster.php (kein
+ * eigener Zugang), damit angemeldete Infomaster-Admins hier Präsentationen
+ * bauen und direkt als Monitor-Inhalt speichern koennen (siehe
+ * "Auf Server speichern (für Monitor)"-Knopf weiter unten im JS-Teil).
+ */
+$SESSION_LIFETIME = 12 * 3600;
+session_set_cookie_params(['lifetime' => $SESSION_LIFETIME, 'path' => '/']);
+ini_set('session.gc_maxlifetime', (string)$SESSION_LIFETIME);
+session_start();
+if (isset($_SESSION['last_activity']) && (time() - $_SESSION['last_activity']) > $SESSION_LIFETIME) {
+    session_unset();
+    session_destroy();
+    session_start();
+}
+$_SESSION['last_activity'] = time();
+if (empty($_SESSION['loggedin'])) {
+    // Nicht (mehr) angemeldet: zurueck zum zentralen Infomaster-Login. Von
+    // dort fuehrt der "Präsentationen"-Link direkt wieder hierher.
+    header('Location: infomaster.php');
+    exit;
+}
+
+// Praesentationen serverseitig ablegen statt nur als Browser-Download - in
+// zwei getrennten Ordnern, je nach Zweck:
+//  - media/bento-pronto/monitors/  -> schreibgeschuetzte Kiosk-Exporte (siehe
+//    "Auf Server speichern (für Monitor)"): die URL kommt 1:1 als Monitor-
+//    Inhalt (Typ "Webseite/URL") in infomaster.php.
+//  - media/bentos/                -> bearbeitbare Praesentationen (siehe
+//    "Bearbeitbar auf Server speichern"): tragen den bento-host-config-Meta-
+//    Tag (siehe unten). Der Ordnername "bentos" ist absichtlich so gewaehlt,
+//    NICHT "bento-pronto/decks" o.ae. - der Bento-Editor selbst erkennt einen
+//    Speichern-Host nur, wenn "bentos" als eigenes Pfadsegment in der URL
+//    vorkommt (siehe editor/hostsave.ts im bento-Projekt, spiegelt exakt
+//    moodle.ts's eigene "mod/bento"-Erkennung, die dabei unangetastet
+//    bleibt). Erst WENN das zutrifft, speichert die BENTO-APP SELBST (der
+//    native Speichern-Knopf im Editor, genau wie bei Moodle-mod_bento) spaeter
+//    direkt wieder in dieselbe Datei zurueck - kein Zwischenschritt hier
+//    noetig, das ?api=save_deck weiter unten uebernimmt das.
+function bentoReadUploadedHtml(): string {
+    if (isset($_FILES['bento_save_html']) && is_uploaded_file($_FILES['bento_save_html']['tmp_name'])) {
+        return (string)file_get_contents($_FILES['bento_save_html']['tmp_name']);
+    }
+    return (string)($_POST['bento_save_html'] ?? '');
+}
+function bentoSafeBaseName(string $raw): string {
+    $name = preg_replace('/[^a-zA-Z0-9-_]/', '_', pathinfo($raw, PATHINFO_FILENAME));
+    return $name === '' ? 'praesentation' : $name;
+}
+function bentoIsHttps(): bool {
+    if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') return true;
+    // Hinter einem Reverse-Proxy (nginx/Apache als SSL-Terminierung davor)
+    // steht $_SERVER['HTTPS'] oft NICHT - der Proxy terminiert TLS und spricht
+    // PHP intern nur per HTTP an. Ohne diesen Fallback wuerde bentoServerUrlFor()
+    // dann faelschlich "http://" in eine tatsaechlich https://-geladene Seite
+    // einbetten - der Browser blockt den anschliessenden Speichern-Request des
+    // Editors dann als "Mixed Content", meist ohne sichtbare Fehlermeldung
+    // ausser in der Browser-Konsole. Nur vertrauenswuerdig, wenn der eigene
+    // Webserver diesen Header tatsaechlich vom Proxy gesetzt bekommt (Standard
+    // bei nginx/Apache-Reverse-Proxy-Konfigurationen).
+    $xfProto = strtolower((string)($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''));
+    if (strpos($xfProto, 'https') !== false) return true;
+    if (!empty($_SERVER['HTTP_X_FORWARDED_SSL']) && strtolower($_SERVER['HTTP_X_FORWARDED_SSL']) === 'on') return true;
+    return false;
+}
+function bentoServerUrlFor(string $relPath): string {
+    $baseUrl = (bentoIsHttps() ? 'https://' : 'http://') . $_SERVER['HTTP_HOST'] . rtrim(dirname($_SERVER['SCRIPT_NAME']), '/');
+    return $baseUrl . '/' . $relPath;
+}
+
+// Liest Titel + Folienanzahl aus einer gespeicherten Datei, fuer die
+// "Deck-Banner"-Liste unten (Gegenstueck zu den Karten in moodle-mod_bento's
+// eigener manage.php) - liest dazu NUR das eingebettete #bento-doc-JSON aus,
+// nicht die ganze (u.U. mehrere MB grosse) Datei komplett in den Speicher.
+function bentoReadDeckMeta(string $path): array {
+    $meta = ['title' => null, 'slideCount' => null];
+    $fh = @fopen($path, 'rb');
+    if (!$fh) return $meta;
+    $chunk = fread($fh, 4 * 1024 * 1024); // #bento-doc liegt weit vorne im Shell-HTML
+    fclose($fh);
+    if ($chunk === false) return $meta;
+    if (!preg_match('/<script[^>]*id=["\']bento-doc["\'][^>]*>([\s\S]*?)<\/script>/', $chunk, $m)) return $meta;
+    $doc = json_decode(trim($m[1]), true);
+    if (!is_array($doc)) return $meta;
+    $meta['title'] = isset($doc['title']) ? (string)$doc['title'] : null;
+    $meta['slideCount'] = isset($doc['slides']) && is_array($doc['slides']) ? count($doc['slides']) : null;
+    return $meta;
+}
+function bentoFormatBytes(int $bytes): string {
+    if ($bytes >= 1024 * 1024) return round($bytes / (1024 * 1024), 1) . ' MB';
+    if ($bytes >= 1024) return round($bytes / 1024) . ' KB';
+    return $bytes . ' B';
+}
+
+// ============================================================================
+// Reihenfolge der gespeicherten bearbeitbaren Praesentationen: von sich aus gibt
+// es dafuer keine Ordnung ausser dem Dateisystem (mtime/Name), das reicht aber
+// nicht, sobald manuell per "Position tauschen" umsortiert werden kann. Eine
+// kleine ".order.json" im selben Ordner haelt die Reihenfolge explizit fest -
+// selbstheilend: fehlt sie oder enthaelt sie geloeschte/unbekannte Dateien,
+// baut bentoLoadDeckOrder() sie automatisch wieder aus dem tatsaechlichen
+// Dateibestand auf (neu entdeckte Dateien nach mtime absteigend ans Ende).
+// ============================================================================
+
+function bentoDeckOrderFile(string $dir): string { return $dir . '/.order.json'; }
+
+function bentoLoadDeckOrder(string $dir): array {
+    if (!is_dir($dir)) return [];
+    $existing = array_values(array_diff(scandir($dir), ['.', '..', '.order.json']));
+    $order = [];
+    $orderFile = bentoDeckOrderFile($dir);
+    if (is_file($orderFile)) {
+        $decoded = json_decode((string)@file_get_contents($orderFile), true);
+        if (is_array($decoded)) $order = array_values(array_filter($decoded, 'is_string'));
+    }
+    $order = array_values(array_intersect($order, $existing)); // nur noch existierende Dateien, gespeicherte Reihenfolge bleibt
+    $missing = array_values(array_diff($existing, $order));
+    if (!empty($missing)) {
+        usort($missing, function ($a, $b) use ($dir) {
+            return (@filemtime($dir . '/' . $b) ?: 0) <=> (@filemtime($dir . '/' . $a) ?: 0);
+        });
+        $order = array_merge($order, $missing);
+    }
+    bentoSaveDeckOrder($dir, $order);
+    return $order;
+}
+
+function bentoSaveDeckOrder(string $dir, array $order): void {
+    @file_put_contents(bentoDeckOrderFile($dir), json_encode(array_values($order)));
+}
+
+function bentoPrependToOrder(string $dir, string $filename): void {
+    $order = array_values(array_diff(bentoLoadDeckOrder($dir), [$filename]));
+    array_unshift($order, $filename);
+    bentoSaveDeckOrder($dir, $order);
+}
+
+function bentoRenameInOrder(string $dir, string $oldName, string $newName): void {
+    $order = array_map(function ($f) use ($oldName, $newName) { return $f === $oldName ? $newName : $f; }, bentoLoadDeckOrder($dir));
+    bentoSaveDeckOrder($dir, $order);
+}
+
+function bentoRemoveFromOrder(string $dir, string $filename): void {
+    bentoSaveDeckOrder($dir, array_values(array_diff(bentoLoadDeckOrder($dir), [$filename])));
+}
+
+function bentoSwapInOrder(string $dir, string $fileA, string $fileB): bool {
+    $order = bentoLoadDeckOrder($dir);
+    $i = array_search($fileA, $order, true);
+    $j = array_search($fileB, $order, true);
+    if ($i === false || $j === false) return false;
+    [$order[$i], $order[$j]] = [$order[$j], $order[$i]];
+    bentoSaveDeckOrder($dir, $order);
+    return true;
+}
+
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST' && (isset($_POST['bento_save_html']) || isset($_FILES['bento_save_html']))) {
+    header('Content-Type: application/json');
+    $uploadBase = 'media/';
+    $html = bentoReadUploadedHtml();
+    if ($html === '') {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => 'Keine Datei erhalten.']);
+        exit;
+    }
+    if (strlen($html) > 60 * 1024 * 1024) { // 60MB Sicherheitsgrenze - mehr braucht keine Praesentation
+        http_response_code(413);
+        echo json_encode(['ok' => false, 'error' => 'Datei zu groß (Limit 60MB).']);
+        exit;
+    }
+
+    $api = $_GET['api'] ?? '';
+    if ($api === 'save_deck') {
+        // Ueberschreiben einer BEREITS bestehenden bearbeitbaren Praesentation
+        // in place - das ist der Endpunkt, den der native "Speichern"-Knopf
+        // im Bento-Editor selbst aufruft (siehe hostConfig.saveUrl, in
+        // diesen Dateien beim ersten Speichern unten mit eingebettet).
+        $dir = $uploadBase . 'bentos';
+        $safeFile = basename((string)($_GET['file'] ?? ''));
+        $path = $dir . '/' . $safeFile;
+        if ($safeFile === '' || !preg_match('/\.html?$/i', $safeFile) || !is_file($path)) {
+            http_response_code(404);
+            echo json_encode(['ok' => false, 'error' => 'Diese Datei existiert nicht (mehr) auf dem Server.']);
+            exit;
+        }
+        if (file_put_contents($path, $html) === false) {
+            http_response_code(500);
+            echo json_encode(['ok' => false, 'error' => 'Konnte Datei nicht auf dem Server speichern.']);
+            exit;
+        }
+        echo json_encode(['ok' => true, 'url' => bentoServerUrlFor($dir . '/' . $safeFile), 'filename' => $safeFile]);
+        exit;
+    }
+
+    // Neuanlage - Ziel (Kiosk-Export fuer Monitore vs. bearbeitbare Praesentation)
+    // kommt vom "kind"-Feld, das die beiden Speichern-Knoepfe unterschiedlich setzen.
+    $kind = ($_POST['bento_kind'] ?? 'monitor') === 'deck' ? 'deck' : 'monitor';
+    // "bentos" fuer bearbeitbare Decks ist absichtlich EIN eigenstaendiges
+    // Pfadsegment direkt unter media/ (nicht media/bento-pronto/decks) - siehe
+    // Kommentar oben: der Bento-Editor erkennt den Speichern-Host nur daran.
+    $dir = $kind === 'deck' ? ($uploadBase . 'bentos') : ($uploadBase . 'bento-pronto/monitors');
+    if (!is_dir($dir)) { @mkdir($dir, 0775, true); }
+    $rawName = bentoSafeBaseName((string)($_POST['bento_filename'] ?? 'praesentation'));
+    $filename = $rawName . '_' . date('Ymd_His') . '.html';
+    $path = $dir . '/' . $filename;
+
+    if ($kind === 'deck') {
+        // bento-host-config VOR dem ersten Speichern in die eigene Kopie
+        // einbetten - danach traegt die Datei sich selbst (jeder weitere
+        // native Speichern-Vorgang im Editor serialisiert die aktuell
+        // geladene Seite samt diesem Meta-Tag automatisch mit, siehe
+        // hostsave.ts im bento-Projekt).
+        // Absolute URLs - die Datei liegt unter media/bentos/, nicht neben
+        // bento.php selbst, also wuerde ein relativer Pfad hier vom FALSCHEN Verzeichnis
+        // aus aufgeloest (dem der Datei beim Oeffnen, nicht dem von bento.php).
+        $saveUrl = bentoServerUrlFor(basename($_SERVER['SCRIPT_NAME'])) . '?api=save_deck&file=' . rawurlencode($filename);
+        $homeUrl = bentoServerUrlFor('infomaster.php');
+        $hostConfig = json_encode([
+            'saveUrl' => $saveUrl,
+            'homeUrl' => $homeUrl,
+            'homeLabel' => 'Infomaster',
+        ], JSON_HEX_APOS | JSON_HEX_QUOT);
+        $metaTag = '<meta name="bento-host-config" content=\'' . $hostConfig . '\'>';
+        if (stripos($html, '<head>') !== false) {
+            $html = preg_replace('/<head>/i', '<head>' . $metaTag, $html, 1);
+        } else {
+            $html = $metaTag . $html; // unerwartete Shell-Form - lieber vorne anhaengen als stillschweigend weglassen
+        }
+    }
+
+    if (!is_dir($dir) || file_put_contents($path, $html) === false) {
+        http_response_code(500);
+        echo json_encode(['ok' => false, 'error' => 'Konnte Datei nicht auf dem Server speichern.']);
+        exit;
+    }
+    if ($kind === 'deck') {
+        // Neueste Praesentation erscheint immer oben - siehe bentoLoadDeckOrder().
+        bentoPrependToOrder($dir, $filename);
+    }
+    echo json_encode(['ok' => true, 'url' => bentoServerUrlFor($dir . '/' . $filename), 'filename' => $filename]);
+    exit;
+}
+
+// Loeschen einer gespeicherten bearbeitbaren Praesentation aus der Liste unten.
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST' && ($_GET['api'] ?? '') === 'delete_deck') {
+    $dir = 'media/bentos';
+    $safeFile = basename((string)($_POST['file'] ?? ''));
+    $path = $dir . '/' . $safeFile;
+    if ($safeFile !== '' && preg_match('/\.html?$/i', $safeFile) && is_file($path)) {
+        @unlink($path);
+        bentoRemoveFromOrder($dir, $safeFile);
+    }
+    header('Location: bento.php');
+    exit;
+}
+
+// Zwei benachbarte Praesentationen in der Liste vertauschen ("Position tauschen"
+// zwischen zwei Bannern) - reine Reihenfolgen-Operation, ruehrt die Dateien
+// selbst nicht an.
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST' && ($_GET['api'] ?? '') === 'swap_decks') {
+    header('Content-Type: application/json');
+    $dir = 'media/bentos';
+    $fileA = basename((string)($_POST['file_a'] ?? ''));
+    $fileB = basename((string)($_POST['file_b'] ?? ''));
+    if ($fileA === '' || $fileB === '' || !is_file($dir . '/' . $fileA) || !is_file($dir . '/' . $fileB)) {
+        http_response_code(404);
+        echo json_encode(['ok' => false, 'error' => 'Datei(en) nicht gefunden.']);
+        exit;
+    }
+    $ok = bentoSwapInOrder($dir, $fileA, $fileB);
+    echo json_encode(['ok' => $ok]);
+    exit;
+}
+
+// Umbenennen: Dateiname UND das interne doc.title werden zusammen
+// aktualisiert (genau wie bei moodle-mod_bento's eigenem Rename - dort setzt
+// derselbe Vorgang sowohl den Deck-"name" als auch doc.title, siehe
+// bentoconvert.js buildItemCard()'s titleSpan-Handler). Der Zeitstempel-Teil
+// des Dateinamens bleibt erhalten, damit die Datei eindeutig bleibt.
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST' && ($_GET['api'] ?? '') === 'rename_deck') {
+    header('Content-Type: application/json');
+    $dir = 'media/bentos';
+    $safeFile = basename((string)($_POST['file'] ?? ''));
+    $path = $dir . '/' . $safeFile;
+    if ($safeFile === '' || !is_file($path)) {
+        http_response_code(404);
+        echo json_encode(['ok' => false, 'error' => 'Datei nicht gefunden.']);
+        exit;
+    }
+    if (!preg_match('/^(.*)(_\d{8}_\d{6})(\.html?)$/i', $safeFile, $m)) {
+        http_response_code(500);
+        echo json_encode(['ok' => false, 'error' => 'Unerwartetes Dateinamensformat.']);
+        exit;
+    }
+    $newTitle = trim((string)($_POST['new_name'] ?? ''));
+    if ($newTitle === '') {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => 'Name darf nicht leer sein.']);
+        exit;
+    }
+    $newBase = bentoSafeBaseName($newTitle);
+    $newFile = $newBase . $m[2] . $m[3];
+    $newPath = $dir . '/' . $newFile;
+    if ($newFile !== $safeFile && is_file($newPath)) {
+        http_response_code(409);
+        echo json_encode(['ok' => false, 'error' => 'Es gibt bereits eine Datei mit diesem Namen.']);
+        exit;
+    }
+    $content = file_get_contents($path);
+    if ($content === false) {
+        http_response_code(500);
+        echo json_encode(['ok' => false, 'error' => 'Konnte Datei nicht lesen.']);
+        exit;
+    }
+    if ($newFile !== $safeFile) {
+        // Die Datei traegt ihr eigenes bento-host-config-Meta-Tag mit
+        // "file=<alterDateiname>" in der saveUrl (siehe Erzeugung oben) - muss
+        // hier mitziehen, sonst zielt der naechste native Speichern-Vorgang
+        // im Editor auf die nicht mehr existierende alte Datei.
+        $content = str_replace('file=' . rawurlencode($safeFile), 'file=' . rawurlencode($newFile), $content);
+    }
+    // doc.title im eingebetteten #bento-doc-JSON mit umsetzen, damit der
+    // angezeigte Titel (aus genau diesem Feld gelesen, siehe bentoReadDeckMeta)
+    // nach dem Umbenennen tatsaechlich den neuen Namen zeigt.
+    if (preg_match('/(<script[^>]*id=["\']bento-doc["\'][^>]*>)([\s\S]*?)(<\/script>)/', $content, $dm)) {
+        $doc = json_decode(trim($dm[2]), true);
+        if (is_array($doc)) {
+            $doc['title'] = $newTitle;
+            // json_encode escaped Schraegstriche standardmaessig ("<" wird so
+            // Teil von "<\/script>" statt "</script>") - schuetzt genau wie
+            // die eigene <-Ersetzung im Bento-Projekt selbst (siehe
+            // dessen save.ts) davor, dass ein "</script>" im JSON-Text den
+            // Script-Block vorzeitig beendet.
+            $newJson = json_encode($doc, JSON_UNESCAPED_UNICODE);
+            if ($newJson !== false) {
+                $content = substr_replace($content, $dm[1] . $newJson . $dm[3], strpos($content, $dm[0]), strlen($dm[0]));
+            }
+        }
+    }
+    if (file_put_contents($path, $content) === false) {
+        http_response_code(500);
+        echo json_encode(['ok' => false, 'error' => 'Konnte Datei nicht speichern.']);
+        exit;
+    }
+    if ($newFile !== $safeFile) {
+        if (!rename($path, $newPath)) {
+            http_response_code(500);
+            echo json_encode(['ok' => false, 'error' => 'Konnte die Datei nicht umbenennen.']);
+            exit;
+        }
+        bentoRenameInOrder($dir, $safeFile, $newFile);
+    }
+    echo json_encode(['ok' => true, 'filename' => $newFile, 'url' => bentoServerUrlFor($dir . '/' . $newFile)]);
+    exit;
+}
+
+/**
  * bento-pronto — a self-hostable, single-PHP-file version of the
  * PPTX→Bento converter (bento-moodle-tools' own template.html), with one
  * capability that tool structurally CAN'T have: a built-in image proxy for
@@ -22,10 +379,12 @@
  */
 
 if (isset($_GET['proxy'])) {
-    // Disabled by default — set to 'yes' to re-enable. Everything below
-    // this still works exactly as before; this switch is the only thing
-    // standing between a request and it.
-    $proxy = 'no';
+    // Im Original standardmaessig deaktiviert (kein eigenes Login). Hier in
+    // infomaster eingebaut sitzt diese Seite bereits hinter dem gemeinsamen
+    // Login (siehe Sitzungspruefung ganz oben in dieser Datei) - daher hier
+    // freigegeben, sonst wuerde "Text einfügen" (Bilder aus der Zwischen-
+    // ablage) fuer angemeldete Admins nicht funktionieren.
+    $proxy = 'yes';
     if ($proxy !== 'yes') {
         http_response_code(403);
         header('Content-Type: text/plain; charset=utf-8');
@@ -272,7 +631,8 @@ if (isset($_GET['proxy'])) {
   .card-top-left{ display:flex; align-items:flex-start; gap:10px; min-width:0; }
   .card-grip{ cursor:grab; color:var(--ink-dim); font-size:16px; line-height:1; padding-top:2px; user-select:none; }
   .card-grip:active{ cursor:grabbing; }
-  .card-name{ font-weight:600; font-size:15px; word-break:break-all; }
+  .card-name{ font-weight:600; font-size:15px; word-break:break-all; cursor:text; }
+  .card-name-input{ font-weight:600; font-size:15px; padding:2px 6px; width:100%; }
   .card-meta{ font-family:var(--mono); font-size:12px; color:var(--ink-dim); margin-top:4px; }
   .pill{
     font-family:var(--mono); font-size:11px; padding:3px 8px; border-radius:100px;
@@ -283,6 +643,19 @@ if (isset($_GET['proxy'])) {
   .card .err-msg{ color:var(--bad); font-size:13px; margin-top:8px; line-height:1.5; }
   .card .warn-list{ margin:10px 0 0; padding-left:18px; color:var(--ink-dim); font-size:12.5px; line-height:1.6; }
   .actions{ display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; }
+  .actions-icons button{
+    width:40px; height:40px; flex:none; padding:0; font-size:17px; line-height:1;
+    display:flex; align-items:center; justify-content:center; position:relative; overflow:hidden;
+  }
+  .actions-icons button.busy{ opacity:.6; cursor:wait; }
+  .btn-progress{
+    position:absolute; left:0; right:0; bottom:0; height:3px; background:transparent;
+  }
+  .actions-icons button.busy .btn-progress{
+    background:linear-gradient(90deg, transparent, rgba(255,255,255,.9), transparent);
+    background-size:60% 100%; animation:btn-progress-sweep 1s linear infinite;
+  }
+  @keyframes btn-progress-sweep{ from{ background-position:-60% 0; } to{ background-position:160% 0; } }
   .connector{ display:flex; justify-content:center; align-items:center; height:34px; position:relative; }
   .connector::before{
     content:''; position:absolute; left:24px; right:24px; top:50%; height:1px;
@@ -403,20 +776,277 @@ if (isset($_GET['proxy'])) {
     display:block; width:100%; margin-top:18px; padding:12px; border:none; border-radius:10px;
     background:var(--accent); color:#2B120A; font-weight:700; font-size:14px; cursor:pointer;
   }
+
+  /* ————— Medien verkleinern / In Teile aufteilen ————— */
+  .mb-modal-box{ width:min(640px, 100%); }
+  .mb-modal-actions{ display:flex; justify-content:flex-end; gap:10px; margin-top:18px; }
+  .mb-split-list{ max-height:44vh; overflow-y:auto; margin-bottom:8px; }
+  .mb-split-row{ display:flex; align-items:center; gap:12px; padding:6px 0; }
+  .mb-split-label{ font-size:13px; color:var(--ink-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .mb-split-thumb{ position:relative; width:120px; height:67.5px; flex:none; border-radius:6px; overflow:hidden; background:var(--tile-paper); border:1px solid var(--line); }
+  .mb-split-thumb-placeholder{ width:100%; height:100%; border:none; background:transparent; cursor:pointer; font-size:16px; color:var(--ink-dim); }
+  .mb-split-thumb-spinner{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:11px; color:var(--ink-dim); }
+  .mb-split-thumb-spinner::after{ content:'…'; }
+  .mb-split-thumb-frame{ position:absolute; top:0; left:0; transform-origin:top left; border:none; pointer-events:none; }
+  .mb-split-break{
+    display:block; width:100%; margin:2px 0; padding:4px 10px; font-size:11px; text-align:left;
+    border:1px dashed var(--line); border-radius:6px; background:transparent; color:var(--ink-dim); cursor:pointer;
+  }
+  .mb-split-break.active{ border-color:var(--accent); color:var(--accent-dim); border-style:solid; font-weight:700; }
+  .mb-split-name-row{ display:flex; align-items:center; gap:10px; font-size:12px; margin-bottom:6px; }
+  .mb-split-name-row span{ flex:0 0 160px; color:var(--ink-dim); }
+  .mb-split-name-row input{ flex:1; padding:6px 8px; }
+  .mb-shrink-settings{ display:flex; gap:16px; margin-bottom:10px; }
+  .mb-shrink-settings label{ font-size:12px; color:var(--ink-dim); display:flex; flex-direction:column; gap:4px; }
+  .mb-shrink-settings input{ width:100px; padding:6px 8px; }
+  .mb-shrink-dupes{ display:block; font-size:12px; margin-bottom:10px; }
+  .mb-shrink-list{ max-height:44vh; overflow-y:auto; }
+  .mb-shrink-row{ display:flex; align-items:center; gap:12px; padding:6px 0; border-bottom:1px solid var(--line); }
+  .mb-shrink-thumb{ width:64px; height:64px; object-fit:cover; border-radius:6px; flex:none; }
+  .mb-shrink-size{ font-size:12px; color:var(--ink-dim); margin-left:auto; }
 </style>
 </head>
 <body>
 <div class="wrap">
 
+  <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:6px;">
+    <a href="infomaster.php" style="font-size:13px; color:#94a3b8; text-decoration:none;">← Zurück zum Infomaster-Dashboard</a>
+    <a href="infomaster.php?logout=1" style="font-size:13px; color:#ff5252; text-decoration:none;">Abmelden</a>
+  </div>
+  <div style="background:#12233e; border:1px solid #1d3a63; border-radius:8px; padding:10px 14px; font-size:12.5px; color:#cbd5e1; margin-bottom:18px; line-height:1.5;">
+    📺 <strong>Für Monitore:</strong> Präsentation unten erzeugen, dann bei der Karte auf
+    „💾 Auf Server speichern (für Monitor)" klicken. Die dabei angezeigte Adresse im
+    Infomaster-Dashboard bei einem Monitor als Inhalt „Webseite (URL)" eintragen — die
+    gespeicherte Präsentation läuft dort automatisch als Endlos-Slideshow.<br>
+    📝 <strong>Zum Weiterbearbeiten:</strong> stattdessen auf „Bearbeitbar auf Server speichern"
+    klicken - die Datei erscheint danach unten in der Liste und lässt sich jederzeit wieder
+    öffnen; der „Speichern"-Knopf im Editor selbst schreibt dann direkt in diese Datei zurück.
+  </div>
+
+  <?php
+    $bentoDecksDir = 'media/bentos';
+    $bentoDeckFiles = bentoLoadDeckOrder($bentoDecksDir); // neueste oben, sonst zuletzt gespeicherte/manuelle Reihenfolge
+  ?>
+  <?php if (!empty($bentoDeckFiles)): ?>
+  <div style="margin-bottom:18px;">
+    <strong style="font-size:13px; color:#e2e8f0; display:block; margin-bottom:10px;">📝 Gespeicherte bearbeitbare Präsentationen</strong>
+    <div id="bentoDeckBanners" style="display:flex; flex-direction:column; max-height:420px; overflow-y:auto;">
+      <?php foreach ($bentoDeckFiles as $deckIdx => $deckFile):
+        $deckPath = $bentoDecksDir . '/' . $deckFile;
+        $deckMeta = bentoReadDeckMeta($deckPath);
+        $deckTitle = $deckMeta['title'] !== null && $deckMeta['title'] !== '' ? $deckMeta['title'] : $deckFile;
+        $deckUrl = $bentoDecksDir . '/' . $deckFile;
+        $deckSize = @filesize($deckPath);
+        $deckMtime = @filemtime($deckPath);
+      ?>
+      <div class="bento-deck-banner" data-file="<?php echo htmlspecialchars($deckFile); ?>" data-size="<?php echo $deckSize !== false ? (int)$deckSize : 0; ?>" style="display:flex; align-items:center; gap:10px; background:#0f0f0f; border:1px solid #2a2a2a; border-radius:8px; padding:10px 12px;">
+        <div style="flex:1; min-width:0;">
+          <div class="bento-deck-title" tabindex="0" title="Gedrückt halten zum Umbenennen" style="font-size:13px; color:#e2e8f0; font-weight:600; cursor:text; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; user-select:none;"><?php echo htmlspecialchars($deckTitle); ?></div>
+          <div style="font-size:11px; color:#8a8a8a; margin-top:2px;">
+            <?php if ($deckMeta['slideCount'] !== null): ?><?php echo (int)$deckMeta['slideCount']; ?> Folie<?php echo $deckMeta['slideCount'] === 1 ? '' : 'n'; ?> · <?php endif; ?>
+            <?php if ($deckSize !== false): ?><?php echo bentoFormatBytes((int)$deckSize); ?> · <?php endif; ?>
+            <?php if ($deckMtime !== false): ?><?php echo date('d.m.Y H:i', $deckMtime); ?><?php endif; ?>
+          </div>
+        </div>
+        <div style="display:flex; gap:6px; flex:0 0 auto; align-items:center;">
+          <a href="<?php echo htmlspecialchars($deckUrl); ?>#present" target="_blank" rel="noopener" title="Präsentation starten" style="width:28px; height:28px; display:flex; align-items:center; justify-content:center; background:#1e293b; color:#93c5fd; border-radius:6px; text-decoration:none;">▶</a>
+          <a href="<?php echo htmlspecialchars($deckUrl); ?>" target="_blank" rel="noopener" title="Bearbeiten (im vollen Editor)" style="width:28px; height:28px; display:flex; align-items:center; justify-content:center; background:#1e293b; color:#93c5fd; border-radius:6px; text-decoration:none;">✎</a>
+          <button type="button" class="bento-deck-load-btn" data-purpose="shrink" title="Hier unten laden, um Medien zu verkleinern" style="width:28px; height:28px; display:flex; align-items:center; justify-content:center; background:#1e293b; color:#93c5fd; border-radius:6px; border:none; cursor:pointer; font-size:14px;">🗜</button>
+          <?php if ($deckMeta['slideCount'] === null || $deckMeta['slideCount'] > 1): ?>
+          <button type="button" class="bento-deck-load-btn" data-purpose="split" title="Hier unten laden, um in Teile aufzuteilen" style="width:28px; height:28px; display:flex; align-items:center; justify-content:center; background:#1e293b; color:#93c5fd; border-radius:6px; border:none; cursor:pointer; font-size:14px;">✂️</button>
+          <?php endif; ?>
+          <a href="<?php echo htmlspecialchars($deckUrl); ?>" download title="Als .bento.html herunterladen" style="width:28px; height:28px; display:flex; align-items:center; justify-content:center; background:#1e293b; color:#93c5fd; border-radius:6px; text-decoration:none;">⬇</a>
+          <form method="POST" action="?api=delete_deck" onsubmit="return confirm('&quot;<?php echo htmlspecialchars(addslashes($deckTitle)); ?>&quot; wirklich löschen?');" style="margin:0;">
+            <input type="hidden" name="file" value="<?php echo htmlspecialchars($deckFile); ?>">
+            <button type="submit" title="Löschen" style="width:28px; height:28px; display:flex; align-items:center; justify-content:center; background:#7f1d1d; color:#fff; border:none; border-radius:6px; cursor:pointer;">✕</button>
+          </form>
+          <button type="button" class="bento-deck-link-btn" title="Link erzeugen (kopieren)" style="width:28px; height:28px; display:flex; align-items:center; justify-content:center; background:#1e293b; color:#93c5fd; border-radius:6px; border:none; cursor:pointer; font-size:14px;">🔗</button>
+        </div>
+      </div>
+      <?php if ($deckIdx < count($bentoDeckFiles) - 1):
+        $nextFile = $bentoDeckFiles[$deckIdx + 1];
+      ?>
+      <div class="connector bento-deck-connector" data-file-a="<?php echo htmlspecialchars($deckFile); ?>" data-file-b="<?php echo htmlspecialchars($nextFile); ?>" style="height:30px;">
+        <button type="button" class="connector-btn bento-deck-swap-btn" title="Position tauschen" style="margin-right:8px;">⇅</button>
+        <button type="button" class="connector-btn bento-deck-connect-btn" title="Verbinden">✚</button>
+      </div>
+      <?php endif; ?>
+      <?php endforeach; ?>
+    </div>
+  </div>
+  <script>
+  // Umbenennen wie bei moodle-mod_bento's eigenen Deck-Bannern, aber per langem
+  // Klick statt Doppelklick (auf Wunsch): Maustaste ~550ms gedrueckt halten,
+  // ohne den Zeiger zu bewegen -> Inline-Eingabefeld -> Enter/Blur speichert
+  // per ?api=rename_deck, Escape bricht ab. Aendert nur den Dateinamen (siehe
+  // PHP-Endpunkt weiter oben); der interne Titel im Dokument selbst bleibt
+  // unangetastet.
+  document.querySelectorAll('.bento-deck-title').forEach(function(titleEl){
+    var pressTimer = null;
+    var startX = 0, startY = 0;
+    function cancelPress(){ if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; } }
+    titleEl.addEventListener('mousedown', function(ev){
+      startX = ev.clientX; startY = ev.clientY;
+      pressTimer = setTimeout(function(){ pressTimer = null; startRename(); }, 550);
+    });
+    titleEl.addEventListener('mousemove', function(ev){
+      if (pressTimer && (Math.abs(ev.clientX - startX) > 6 || Math.abs(ev.clientY - startY) > 6)) cancelPress();
+    });
+    titleEl.addEventListener('mouseup', cancelPress);
+    titleEl.addEventListener('mouseleave', cancelPress);
+    function startRename(){
+      var banner = titleEl.closest('.bento-deck-banner');
+      var file = banner.getAttribute('data-file');
+      var original = titleEl.textContent;
+      var input = document.createElement('input');
+      input.type = 'text';
+      input.value = original;
+      input.style.cssText = 'font-size:13px; padding:3px 6px; width:100%; background:#000; color:#fff; border:1px solid #38bdf8; border-radius:4px;';
+      titleEl.replaceWith(input);
+      input.focus();
+      input.select();
+      var done = false;
+      function commit(save){
+        if (done) return; done = true;
+        var next = input.value.trim();
+        if (!save || !next || next === original) { input.replaceWith(titleEl); return; }
+        input.disabled = true;
+        var fd = new FormData();
+        fd.append('file', file);
+        fd.append('new_name', next);
+        fetch('?api=rename_deck', { method: 'POST', body: fd })
+          .then(function(r){ return r.json(); })
+          .then(function(data){
+            if (!data.ok) { alert('Konnte nicht umbenennen: ' + (data.error || '?')); input.replaceWith(titleEl); return; }
+            location.reload(); // Dateiname im data-file-Attribut + Buttons muessen neu aufgebaut werden
+          })
+          .catch(function(e){ alert('Konnte nicht umbenennen: ' + e); input.replaceWith(titleEl); });
+      }
+      input.addEventListener('keydown', function(ev){
+        if (ev.key === 'Enter') { ev.preventDefault(); commit(true); }
+        else if (ev.key === 'Escape') { ev.preventDefault(); commit(false); }
+      });
+      input.addEventListener('blur', function(){ commit(true); });
+    }
+  });
+
+  // Laedt eine bereits gespeicherte Praesentation unten in die Kartenansicht ein
+  // (derselbe Import-Weg wie ein per Drag&Drop abgelegtes .bento.html - handleFiles,
+  // weiter unten definiert, ist zum Zeitpunkt eines tatsaechlichen Klicks laengst
+  // vorhanden) - von dort aus stehen dieselben Karten-Aktionen (🗜 Medien
+  // verkleinern, ✂️ In Teile aufteilen, erneut speichern, …) zur Verfuegung wie
+  // fuer eine frisch konvertierte. "shrink" und "split" fuehren beide hierher,
+  // nur mit unterschiedlichem Icon/Tooltip als Eintrittspunkt.
+  async function bentoLoadDeckFileIntoCards(file){
+    var resp = await fetch('media/bentos/' + encodeURIComponent(file));
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    var text = await resp.text();
+    var blob = new Blob([text], { type: 'text/html' });
+    return new File([blob], file, { type: 'text/html' });
+  }
+  document.querySelectorAll('.bento-deck-load-btn').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var banner = btn.closest('.bento-deck-banner');
+      var file = banner.getAttribute('data-file');
+      var original = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '…';
+      bentoLoadDeckFileIntoCards(file)
+        .then(function(syntheticFile){
+          handleFiles([syntheticFile]);
+          document.querySelector('#items')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        })
+        .catch(function(e){ alert('Konnte die Datei nicht laden: ' + (e.message || e)); })
+        .finally(function(){ btn.disabled = false; btn.textContent = original; });
+    });
+  });
+
+  // 🔗 Link erzeugen: kopiert die Abspiel-Adresse dieser Praesentation
+  // (dieselbe wie hinter "▶ Präsentation starten") in die Zwischenablage.
+  document.querySelectorAll('.bento-deck-link-btn').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var banner = btn.closest('.bento-deck-banner');
+      var file = banner.getAttribute('data-file');
+      var url = new URL('media/bentos/' + encodeURIComponent(file) + '#present', location.href).href;
+      navigator.clipboard.writeText(url).then(function(){
+        toast('🔗 Link kopiert');
+      }).catch(function(){
+        prompt('Link zum manuellen Kopieren:', url);
+      });
+    });
+  });
+
+  // ⇅ Position tauschen: vertauscht zwei benachbarte Banner in der Liste
+  // (persistiert ueber ?api=swap_decks, siehe bentoSwapInOrder() in PHP).
+  document.querySelectorAll('.bento-deck-swap-btn').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var connector = btn.closest('.bento-deck-connector');
+      var fileA = connector.getAttribute('data-file-a');
+      var fileB = connector.getAttribute('data-file-b');
+      btn.disabled = true;
+      var fd = new FormData();
+      fd.append('file_a', fileA);
+      fd.append('file_b', fileB);
+      fetch('?api=swap_decks', { method: 'POST', body: fd })
+        .then(function(r){ return r.json(); })
+        .then(function(data){
+          if (!data.ok) { alert('Konnte Reihenfolge nicht ändern: ' + (data.error || '?')); btn.disabled = false; return; }
+          location.reload();
+        })
+        .catch(function(e){ alert('Konnte Reihenfolge nicht ändern: ' + e); btn.disabled = false; });
+    });
+  });
+
+  // ✚ Verbinden (zwischen zwei bereits gespeicherten Praesentationen, wie im
+  // moodle-Plugin zwischen den Deck-Bannern): beide Dateien unten in die
+  // Kartenansicht laden und dort per derselben mergeItems()-Logik verbinden
+  // wie bei frisch konvertierten Karten - Ergebnis ist eine neue, noch
+  // UNGESPEICHERTE Karte, die erst per "Bearbeitbar speichern" persistiert
+  // wird (kein automatisches Ueberschreiben der beiden Originaldateien).
+  document.querySelectorAll('.bento-deck-connect-btn').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var connector = btn.closest('.bento-deck-connector');
+      var fileA = connector.getAttribute('data-file-a');
+      var fileB = connector.getAttribute('data-file-b');
+      var bannerA = document.querySelector('.bento-deck-banner[data-file="' + CSS.escape(fileA) + '"]');
+      var bannerB = document.querySelector('.bento-deck-banner[data-file="' + CSS.escape(fileB) + '"]');
+      var sizeA = parseInt((bannerA && bannerA.getAttribute('data-size')) || '0', 10);
+      var sizeB = parseInt((bannerB && bannerB.getAttribute('data-size')) || '0', 10);
+      var totalMb = (sizeA + sizeB) / (1024 * 1024);
+      var msg = '"' + fileA + '" und "' + fileB + '" zu einer gemeinsamen Präsentation verbinden?';
+      if (totalMb >= 20) {
+        msg += '\n\nHinweis: Die verbundene Präsentation wird voraussichtlich rund ' + totalMb.toFixed(1) + ' MB groß - das kann je nach Verbindung länger dauern und im Browser spürbar mehr Arbeitsspeicher brauchen.';
+      }
+      if (!confirm(msg)) return;
+      btn.disabled = true;
+      Promise.all([bentoLoadDeckFileIntoCards(fileA), bentoLoadDeckFileIntoCards(fileB)])
+        .then(function(files){
+          var startLen = items.length;
+          return handleFiles(files).then(function(){
+            if (items.length === startLen + 2) {
+              mergeItems(startLen, startLen + 1);
+              document.querySelector('#items')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            } else {
+              toast('Verbinden fehlgeschlagen: mindestens eine Datei konnte nicht geladen werden.');
+            }
+          });
+        })
+        .catch(function(e){ alert('Konnte nicht verbinden: ' + (e.message || e)); })
+        .finally(function(){ btn.disabled = false; });
+    });
+  });
+  </script>
+  <?php endif; ?>
+
   <header>
     <p class="eyebrow">PPTX → bento/slides</p>
     <h1><span class="box"></span>Präsentationen im Browser</h1>
     <p class="lede">
-      Wandelt <code>.pptx</code>-Dateien um — oder importiert schon fertige
-      <code>bento/slides</code>-JSON- bzw. <code>.bento.html</code>-Dateien direkt. Alles läuft
-      lokal im Browser, nichts wird hochgeladen. Mehrere Präsentationen lassen sich per Drag &amp;
-      Drop sortieren und über die <b>✚</b>-Schaltfläche zwischen ihren Karten zu einer
-      gemeinsamen Präsentation verbinden.
+      Diese Seite wandelt <code>.pptx</code>-Präsentationen in HTML-Dateien um, die sich in
+      jedem Browser abspielen lassen. Diese können heruntergeladen, gespeichert, im Browser
+      geändert und wiederverwendet werden. Präsentationen lassen sich per Drag &amp; Drop
+      sortieren und über die <b>✚</b>-Schaltfläche zwischen ihren Karten zu einer gemeinsamen
+      Präsentation verbinden.
     </p>
   </header>
 
@@ -1029,6 +1659,379 @@ function mergeDocs(docA, docB){
   return merged;
 }
 
+// ---------------- Medien verkleinern & In Teile aufteilen ----------------
+// Portiert aus moodle-mod_bentos bentoconvert.js (dieselbe Funktionalität wie
+// dort in manage.php - siehe dessen eigenen Kommentar dazu: reines Client-JS
+// ohne Build-Schritt, arbeitet nur auf dem doc-Objekt, daher 1:1 uebertragbar).
+
+/** Ermittelt alle tatsaechlich von Folien/Layouts referenzierten Asset- und
+ *  Font-Keys - Grundlage fuer bentoBuildSplitDoc() (ein Teil bekommt nur die
+ *  Assets, die seine eigenen Folien wirklich brauchen). */
+function bentoFindUsedAssetAndFontKeys(doc){
+  const assetKeys = {};
+  const fontFamiliesInUse = {};
+  if (doc.theme && doc.theme.fontFamily) fontFamiliesInUse[doc.theme.fontFamily] = true;
+  const assetKeyFrom = (value) => (typeof value === 'string' && value.indexOf('asset:') === 0) ? value.slice('asset:'.length) : null;
+  function visitElement(el){
+    if (!el || !el.type) return;
+    if (el.type === 'image'){
+      const src = assetKeyFrom(el.src); if (src) assetKeys[src] = true;
+      const mask = assetKeyFrom(el.mask); if (mask) assetKeys[mask] = true;
+    } else if (el.type === 'svg'){
+      if (el.asset) assetKeys[el.asset] = true;
+    } else if (el.type === 'media'){
+      const msrc = assetKeyFrom(el.src); if (msrc) assetKeys[msrc] = true;
+      const poster = assetKeyFrom(el.poster); if (poster) assetKeys[poster] = true;
+    } else if (el.type === 'text'){
+      if (el.fontFamily) fontFamiliesInUse[el.fontFamily] = true;
+    } else if (el.type === 'table'){
+      if (el.style && el.style.fontFamily) fontFamiliesInUse[el.style.fontFamily] = true;
+    } else if (el.type === 'chart'){
+      const str = JSON.stringify(el.option || {});
+      let m; const re = /asset:([a-zA-Z0-9_-]+)/g;
+      while ((m = re.exec(str))) assetKeys[m[1]] = true;
+    }
+  }
+  const visitSlide = (s) => (s.elements || []).forEach(visitElement);
+  (doc.slides || []).forEach(visitSlide);
+  (doc.layouts || []).forEach(visitSlide);
+  const fontKeys = {};
+  (doc.fonts || []).forEach((f) => { if (fontFamiliesInUse[f.family]) { fontKeys[f.asset] = true; assetKeys[f.asset] = true; } });
+  return { assetKeys, fontKeys };
+}
+
+/** Baut ein eigenstaendiges Dokument aus einer zusammenhaengenden Folge von
+ *  doc.slides - nur die Assets/Fonts, die genau diese Folien tatsaechlich
+ *  verwenden, kommen mit (siehe bentoFindUsedAssetAndFontKeys). */
+function bentoBuildSplitDoc(doc, startIdx, endIdx){
+  const part = JSON.parse(JSON.stringify(doc));
+  part.slides = (doc.slides || []).slice(startIdx, endIdx);
+  const used = bentoFindUsedAssetAndFontKeys(part);
+  if (part.assets) Object.keys(part.assets).forEach((k) => { if (!used.assetKeys[k]) delete part.assets[k]; });
+  if (part.fonts) part.fonts = part.fonts.filter((f) => used.fontKeys[f.asset]);
+  return part;
+}
+
+function bentoRemapAssetRefs(node, keyMap){
+  if (typeof node === 'string'){
+    const m = /^asset:(.+)$/.exec(node);
+    return (m && keyMap[m[1]]) ? 'asset:' + keyMap[m[1]] : node;
+  }
+  if (Array.isArray(node)) return node.map((n) => bentoRemapAssetRefs(n, keyMap));
+  if (node && typeof node === 'object'){
+    const out = {};
+    for (const k in node) out[k] = bentoRemapAssetRefs(node[k], keyMap);
+    return out;
+  }
+  return node;
+}
+
+/** Echte dekodierte Byte-Groesse eines data:-URIs (base64-Aufblaehung + Padding
+ *  beruecksichtigt), nicht die rohe String-Laenge. */
+function bentoDataUriByteSize(dataUri){
+  const comma = dataUri.indexOf(',');
+  if (comma < 0) return dataUri.length;
+  const payload = dataUri.slice(comma + 1);
+  if (!/;base64$/.test(dataUri.slice(0, comma))) return payload.length;
+  const padding = payload.slice(-2) === '==' ? 2 : payload.slice(-1) === '=' ? 1 : 0;
+  return Math.floor((payload.length * 3) / 4) - padding;
+}
+
+/** PNG bleibt PNG (Transparenz), alles andere wird JPEG; loest unveraendert
+ *  auf, falls schon klein genug oder bei jedem Dekodier-Fehler. */
+function bentoDownscaleImageDataUrl(dataUrl, maxDim, quality){
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
+      if (scale >= 1){ resolve(dataUrl); return; }
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.naturalWidth * scale);
+      canvas.height = Math.round(img.naturalHeight * scale);
+      const ctx = canvas.getContext('2d');
+      if (!ctx){ resolve(dataUrl); return; }
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const isPng = dataUrl.indexOf('data:image/png') === 0;
+      resolve(canvas.toDataURL(isPng ? 'image/png' : 'image/jpeg', quality));
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
+
+function slideLabel(slide, idx){
+  let found = null;
+  (function walk(node){
+    if (found || !node || typeof node !== 'object') return;
+    if (Array.isArray(node)){ node.forEach(walk); return; }
+    if (typeof node.text === 'string' && node.text.trim()){ found = node.text.trim(); return; }
+    if (typeof node.content === 'string' && node.content.trim()){ found = node.content.trim(); return; }
+    for (const k in node) walk(node[k]);
+  })(slide.elements || []);
+  const text = found ? found.slice(0, 40) + (found.length > 40 ? '…' : '') : '(ohne Text)';
+  return 'Folie ' + (idx + 1) + ' — ' + text;
+}
+
+// Ein Thumbnail (iframe-Render) nach dem anderen - alle gleichzeitig zu bauen
+// machte das Modal bei vielen Folien spuerbar traege.
+const thumbnailQueue = [];
+let thumbnailQueueRunning = false;
+function pumpThumbnailQueue(){
+  if (thumbnailQueueRunning || !thumbnailQueue.length) return;
+  thumbnailQueueRunning = true;
+  const job = thumbnailQueue.shift();
+  job(() => { thumbnailQueueRunning = false; pumpThumbnailQueue(); });
+}
+
+function buildSlideThumbnail(doc, idx){
+  const wrap = document.createElement('div');
+  wrap.className = 'mb-split-thumb';
+  const placeholder = document.createElement('button');
+  placeholder.type = 'button';
+  placeholder.className = 'mb-split-thumb-placeholder';
+  placeholder.textContent = '▶';
+  placeholder.title = 'Vorschau laden';
+  wrap.appendChild(placeholder);
+  let loaded = false;
+  function load(){
+    if (loaded) return;
+    loaded = true;
+    placeholder.remove();
+    const spinner = document.createElement('div');
+    spinner.className = 'mb-split-thumb-spinner';
+    wrap.appendChild(spinner);
+    const w = (doc.size && doc.size.width) || 1280;
+    const h = (doc.size && doc.size.height) || 720;
+    const iframe = document.createElement('iframe');
+    iframe.className = 'mb-split-thumb-frame';
+    iframe.style.width = w + 'px';
+    iframe.style.height = h + 'px';
+    iframe.style.transform = 'scale(' + (120 / w) + ')';
+    iframe.setAttribute('tabindex', '-1');
+    iframe.setAttribute('aria-hidden', 'true');
+    iframe.setAttribute('sandbox', 'allow-scripts');
+    wrap.appendChild(iframe);
+    thumbnailQueue.push((done) => {
+      const finish = () => { spinner.remove(); done(); };
+      getShell().then((shell) => {
+        const slideDoc = {
+          format: doc.format, version: doc.version || 1,
+          docId: 'thumb-' + idx, title: doc.title || '',
+          size: doc.size || { width: 1280, height: 720 },
+          theme: doc.theme || { background: '#FFFFFF', color: '#111111', accent: '#FF9E5E', fontFamily: 'system-ui, sans-serif' },
+          assets: doc.assets, slides: [doc.slides[idx]],
+          readonly: true,
+        };
+        const html = spliceDoc(shell, slideDoc);
+        iframe.addEventListener('load', finish, { once: true });
+        iframe.srcdoc = html;
+      }).catch((e) => { console.warn('Thumbnail konnte nicht geladen werden:', e); finish(); });
+    });
+    pumpThumbnailQueue();
+  }
+  placeholder.addEventListener('click', load);
+  return { el: wrap, load };
+}
+
+function openSplitModal(it, onDone){
+  const slides = it.doc.slides || [];
+  const breakAfter = new Array(slides.length - 1).fill(false);
+  const customNames = [];
+
+  const overlay = document.createElement('div');
+  overlay.className = 'paste-modal show';
+  const box = document.createElement('div');
+  box.className = 'paste-modal-inner mb-modal-box';
+  box.innerHTML = `
+    <button class="paste-modal-close" type="button">✕</button>
+    <h3>In Teile aufteilen</h3>
+    <p>Zwischen zwei Folien klicken, um dort eine Trennung einzufügen. Jeder entstehende Teil bekommt nur die Assets, die seine eigenen Folien tatsächlich verwenden.</p>
+    <button type="button" class="mb-split-load-all" style="width:auto; margin-bottom:12px;">Alle Thumbnails öffnen</button>
+    <div class="mb-split-list"></div>
+    <div class="mb-split-names"></div>
+    <div class="mb-modal-actions">
+      <button type="button" class="mb-split-cancel" style="width:auto;">Abbrechen</button>
+      <button type="button" class="primary mb-split-confirm" style="width:auto;">Aufteilen</button>
+    </div>`;
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+
+  const listEl = box.querySelector('.mb-split-list');
+  const namesEl = box.querySelector('.mb-split-names');
+  const confirmBtn = box.querySelector('.mb-split-confirm');
+  const thumbLoaders = [];
+
+  function computeGroups(){
+    const groups = [];
+    let current = [];
+    slides.forEach((_, idx) => {
+      current.push(idx);
+      if (breakAfter[idx]){ groups.push(current); current = []; }
+    });
+    if (current.length) groups.push(current);
+    return groups;
+  }
+  function renderNameInputs(){
+    const groups = computeGroups();
+    namesEl.innerHTML = '';
+    if (groups.length <= 1) return;
+    groups.forEach((g, partNum) => {
+      const row = document.createElement('label');
+      row.className = 'mb-split-name-row';
+      row.innerHTML = `<span>Teil ${partNum + 1} (${g.length} Folie${g.length === 1 ? '' : 'n'})</span>`;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = customNames[partNum] || ((it.doc.title || it.baseName || 'Deck') + ' — Teil ' + (partNum + 1));
+      input.addEventListener('input', () => { customNames[partNum] = input.value; });
+      row.appendChild(input);
+      namesEl.appendChild(row);
+    });
+  }
+  function updateConfirmState(){
+    const partCount = breakAfter.filter(Boolean).length + 1;
+    confirmBtn.textContent = partCount > 1 ? ('In ' + partCount + ' Teile aufteilen') : 'Keine Trennung gewählt';
+    confirmBtn.disabled = partCount <= 1;
+    renderNameInputs();
+  }
+
+  slides.forEach((slide, idx) => {
+    const row = document.createElement('div');
+    row.className = 'mb-split-row';
+    const thumb = buildSlideThumbnail(it.doc, idx);
+    thumbLoaders.push(thumb.load);
+    row.appendChild(thumb.el);
+    const label = document.createElement('div');
+    label.className = 'mb-split-label';
+    label.textContent = slideLabel(slide, idx);
+    row.appendChild(label);
+    listEl.appendChild(row);
+    if (idx < slides.length - 1){
+      const brk = document.createElement('button');
+      brk.type = 'button';
+      brk.className = 'mb-split-break';
+      brk.textContent = '+ Trennung hier einfügen';
+      brk.addEventListener('click', () => {
+        breakAfter[idx] = !breakAfter[idx];
+        brk.className = 'mb-split-break' + (breakAfter[idx] ? ' active' : '');
+        brk.textContent = breakAfter[idx] ? '✂ Trennung hier — klicken zum Entfernen' : '+ Trennung hier einfügen';
+        updateConfirmState();
+      });
+      listEl.appendChild(brk);
+    }
+  });
+  updateConfirmState();
+  box.querySelector('.mb-split-load-all').addEventListener('click', () => thumbLoaders.forEach((load) => load()));
+
+  const close = () => overlay.remove();
+  box.querySelector('.paste-modal-close').addEventListener('click', close);
+  box.querySelector('.mb-split-cancel').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  confirmBtn.addEventListener('click', () => {
+    const groups = computeGroups();
+    const newItems = groups.map((g, partNum) => {
+      const partDoc = bentoBuildSplitDoc(it.doc, g[0], g[g.length - 1] + 1);
+      const name = (customNames[partNum] || '').trim() || ((it.doc.title || it.baseName || 'Deck') + ' — Teil ' + (partNum + 1));
+      partDoc.title = name;
+      partDoc.docId = (crypto.randomUUID ? crypto.randomUUID() : 'part-' + Date.now() + '-' + partNum);
+      return { baseName: name, doc: partDoc, slideCount: partDoc.slides.length, warnings: [] };
+    });
+    close();
+    onDone(newItems);
+  });
+}
+
+function openShrinkAssetsModal(it, onDone){
+  const assets = it.doc.assets || {};
+  const imageEntries = Object.keys(assets)
+    .map((key) => ({ key, value: assets[key], bytes: bentoDataUriByteSize(assets[key]) }))
+    .filter((e) => e.value.indexOf('data:image/') === 0)
+    .sort((a, b) => b.bytes - a.bytes);
+
+  if (imageEntries.length === 0){ toast('Keine eingebetteten Bilder in dieser Präsentation.'); return; }
+
+  const byValue = {};
+  imageEntries.forEach((e) => { (byValue[e.value] = byValue[e.value] || []).push(e.key); });
+  let dupCount = 0;
+  Object.keys(byValue).forEach((v) => { if (byValue[v].length > 1) dupCount += byValue[v].length - 1; });
+
+  const overlay = document.createElement('div');
+  overlay.className = 'paste-modal show';
+  const box = document.createElement('div');
+  box.className = 'paste-modal-inner mb-modal-box';
+  box.innerHTML = `
+    <button class="paste-modal-close" type="button">✕</button>
+    <h3>Medien verkleinern</h3>
+    <p>Ausgewählte Bilder werden auf die angegebene Kantenlänge verkleinert und neu komprimiert (PNG bleibt PNG, alles andere wird JPEG).</p>
+    <div class="mb-shrink-settings">
+      <label>Max. Kantenlänge (px)<input type="number" class="mb-shrink-maxdim" min="200" max="8000" value="1920"></label>
+      <label>Qualität (%)<input type="number" class="mb-shrink-quality" min="10" max="100" value="85"></label>
+    </div>
+    ${dupCount > 0 ? `<label class="mb-shrink-dupes"><input type="checkbox" class="mb-shrink-dedupe" checked> ${dupCount} doppelte Bilder gefunden — entfernen</label>` : ''}
+    <div class="mb-shrink-list"></div>
+    <div class="mb-modal-actions">
+      <button type="button" class="mb-shrink-cancel" style="width:auto;">Abbrechen</button>
+      <button type="button" class="primary mb-shrink-confirm" style="width:auto;">Anwenden</button>
+    </div>`;
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+
+  const listEl = box.querySelector('.mb-shrink-list');
+  const maxDimInput = box.querySelector('.mb-shrink-maxdim');
+  const qualityInput = box.querySelector('.mb-shrink-quality');
+  const dedupeCb = box.querySelector('.mb-shrink-dedupe');
+  const rows = [];
+  imageEntries.forEach((e) => {
+    const row = document.createElement('div');
+    row.className = 'mb-shrink-row';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = true;
+    row.appendChild(cb);
+    const thumb = document.createElement('img');
+    thumb.className = 'mb-shrink-thumb';
+    thumb.src = e.value;
+    thumb.loading = 'lazy';
+    row.appendChild(thumb);
+    const sizeEl = document.createElement('span');
+    sizeEl.className = 'mb-shrink-size';
+    sizeEl.textContent = (e.bytes / 1024).toFixed(0) + ' KB';
+    row.appendChild(sizeEl);
+    listEl.appendChild(row);
+    rows.push({ entry: e, checkbox: cb });
+  });
+
+  const close = () => overlay.remove();
+  box.querySelector('.paste-modal-close').addEventListener('click', close);
+  box.querySelector('.mb-shrink-cancel').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+  const confirmBtn = box.querySelector('.mb-shrink-confirm');
+  confirmBtn.addEventListener('click', () => {
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = 'Wird verarbeitet…';
+    const maxDim = parseInt(maxDimInput.value, 10) || 1920;
+    const quality = (parseInt(qualityInput.value, 10) || 85) / 100;
+    const toShrink = rows.filter((r) => r.checkbox.checked);
+    Promise.all(toShrink.map((r) => bentoDownscaleImageDataUrl(r.entry.value, maxDim, quality).then((shrunk) => { it.doc.assets[r.entry.key] = shrunk; })))
+      .then(() => {
+        if (dedupeCb && dedupeCb.checked){
+          const byValue2 = {};
+          const keyMap = {};
+          Object.keys(it.doc.assets).forEach((key) => {
+            const val = it.doc.assets[key];
+            if (Object.prototype.hasOwnProperty.call(byValue2, val)) keyMap[key] = byValue2[val];
+            else byValue2[val] = key;
+          });
+          Object.keys(keyMap).forEach((oldKey) => { delete it.doc.assets[oldKey]; });
+          it.doc.slides = bentoRemapAssetRefs(it.doc.slides, keyMap);
+          if (it.doc.fonts) it.doc.fonts = it.doc.fonts.map((f) => keyMap[f.asset] ? Object.assign({}, f, { asset: keyMap[f.asset] }) : f);
+        }
+        close();
+        onDone();
+      });
+  });
+}
+
 function toast(msg, duration){
   toastEl.textContent = msg;
   toastEl.classList.add('show');
@@ -1150,26 +2153,59 @@ function buildItemCard(it){
       <div class="card-top-left">
         <div class="card-grip" title="Ziehen zum Sortieren">⠿</div>
         <div>
-          <div class="card-name">${esc(it.baseName)} → ${esc(it.baseName)}.bento.html</div>
+          <div class="card-name" tabindex="0" title="Doppelklick zum Umbenennen">${esc(it.baseName)}</div>
           <div class="card-meta">${it.slideCount} Folie${it.slideCount===1?'':'n'} · ${it.doc.size.width}×${it.doc.size.height}px</div>
         </div>
       </div>
       <span class="pill ok">${it.merged ? 'verbunden' : 'fertig'}</span>
     </div>
     ${it.warnings && it.warnings.length ? `<ul class="warn-list">${it.warnings.map(w=>`<li>${esc(w)}</li>`).join('')}</ul>` : ''}
-    <div class="actions">
-      <button class="primary" data-action="html">Als .bento.html herunterladen</button>
-      <button data-action="open">Direkt öffnen</button>
-      <button data-action="download">Nur JSON herunterladen</button>
-      <button data-action="copy">JSON kopieren</button>
+    <div class="actions actions-icons">
+      <button class="primary" data-action="html" title="Als .bento.html herunterladen">⬇</button>
+      <button data-action="save-server" title="Auf Server speichern (für Monitor)">📺<span class="btn-progress"></span></button>
+      <button data-action="save-deck" title="Bearbeitbar auf Server speichern">📝<span class="btn-progress"></span></button>
+      <button data-action="open" title="Direkt öffnen (nicht gespeichert)">↗</button>
+      <button data-action="download" title="Nur JSON herunterladen">📄</button>
+      <button data-action="copy" title="JSON kopieren">📋</button>
+      <button data-action="shrink" title="Medien verkleinern">🗜</button>
+      ${it.slideCount > 1 ? `<button data-action="split" title="In Teile aufteilen">✂️</button>` : ''}
     </div>
-    <div class="fetch-note" style="display:none" class="err-msg"></div>`;
+    <div class="fetch-note" style="display:none" class="err-msg"></div>
+    <div class="save-server-result" style="display:none; margin-top:10px; background:#0f2a1c; border:1px solid #1f6b3f; border-radius:6px; padding:10px 12px; font-size:12px; color:#bbf7d0;"></div>
+    <div class="save-deck-result" style="display:none; margin-top:10px; background:#0b1f3a; border:1px solid #1e3a63; border-radius:6px; padding:10px 12px; font-size:12px; color:#bfdbfe;"></div>`;
+
+  const nameEl = card.querySelector('.card-name');
+  nameEl.addEventListener('dblclick', () => {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'card-name-input';
+    input.value = it.baseName;
+    nameEl.replaceWith(input);
+    input.focus();
+    input.select();
+    let done = false;
+    function commit(save){
+      if (done) return; done = true;
+      const next = input.value.trim();
+      if (save && next && next !== it.baseName){
+        it.baseName = next;
+        it.doc.title = next;
+        renderItems();
+        return;
+      }
+      input.replaceWith(nameEl);
+    }
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter'){ ev.preventDefault(); commit(true); }
+      else if (ev.key === 'Escape'){ ev.preventDefault(); commit(false); }
+    });
+    input.addEventListener('blur', () => commit(true));
+  });
 
   const htmlBtn = card.querySelector('[data-action="html"]');
   htmlBtn.addEventListener('click', async () => {
-    const original = htmlBtn.textContent;
     htmlBtn.disabled = true;
-    htmlBtn.textContent = 'Lade Bento-App…';
+    htmlBtn.classList.add('busy');
     try{
       const { filename, html } = await buildBentoHtml(it.doc, it.baseName);
       download(filename, html, 'text/html');
@@ -1184,13 +2220,94 @@ function buildItemCard(it){
         'nutzen und über About → Replace document from JSON… in bento.page/slides einfügen.';
     } finally {
       htmlBtn.disabled = false;
-      htmlBtn.textContent = original;
+      htmlBtn.classList.remove('busy');
+    }
+  });
+
+  const saveServerBtn = card.querySelector('[data-action="save-server"]');
+  saveServerBtn.addEventListener('click', async () => {
+    saveServerBtn.disabled = true;
+    saveServerBtn.classList.add('busy');
+    const resultBox = card.querySelector('.save-server-result');
+    try{
+      // Als schreibgeschützte Datei bauen (eigene Kopie, das Original in
+      // items[] bleibt weiter bearbeitbar): so startet die gespeicherte
+      // Version am Monitor automatisch als Slideshow statt im Editor zu
+      // landen (siehe playerMode/?autostart in der Bento-App).
+      const kioskDoc = Object.assign({}, it.doc, { readonly: true });
+      const { filename, html } = await buildBentoHtml(kioskDoc, it.baseName);
+      const fd = new FormData();
+      fd.append('bento_save_html', html);
+      fd.append('bento_filename', filename);
+      fd.append('bento_kind', 'monitor');
+      const resp = await fetch('', { method: 'POST', body: fd });
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) throw new Error(data.error || ('Serverfehler (' + resp.status + ')'));
+      const monitorUrl = data.url + '?autostart=1&loop';
+      resultBox.style.display = 'block';
+      resultBox.innerHTML =
+        '✅ Gespeichert. Diese Adresse im Infomaster-Dashboard bei einem Monitor als Inhalt „Webseite (URL)" eintragen:<br>' +
+        '<div style="display:flex; gap:6px; align-items:center; margin-top:6px;">' +
+        '<input type="text" readonly value="' + esc(monitorUrl) + '" class="save-server-url" style="flex:1; font-size:11px; padding:6px; background:#04110a; color:#bbf7d0; border:1px solid #1f6b3f; border-radius:4px;">' +
+        '<button type="button" class="save-server-copy" style="width:auto; padding:6px 10px; font-size:11px;">Kopieren</button>' +
+        '</div>';
+      resultBox.querySelector('.save-server-copy').addEventListener('click', async () => {
+        await navigator.clipboard.writeText(monitorUrl);
+        toast('Adresse kopiert');
+      });
+      toast('Für Monitor gespeichert ✓');
+    } catch(e){
+      console.error(e);
+      resultBox.style.display = 'block';
+      resultBox.style.background = '#2a0f0f';
+      resultBox.style.borderColor = '#6b1f1f';
+      resultBox.style.color = '#fecaca';
+      resultBox.textContent = 'Fehler beim Speichern: ' + (e.message || e);
+    } finally {
+      saveServerBtn.disabled = false;
+      saveServerBtn.classList.remove('busy');
+    }
+  });
+
+  const saveDeckBtn = card.querySelector('[data-action="save-deck"]');
+  saveDeckBtn.addEventListener('click', async () => {
+    saveDeckBtn.disabled = true;
+    saveDeckBtn.classList.add('busy');
+    const resultBox = card.querySelector('.save-deck-result');
+    try{
+      // KEIN readonly hier - die Datei landet weiterhin im vollen Editor,
+      // inkl. eingebettetem bento-host-config (siehe PHP oben): der native
+      // "Speichern"-Knopf im Editor schreibt danach direkt wieder in
+      // dieselbe Datei zurück, genau wie bei einer Moodle-mod_bento-Aktivität.
+      const { filename, html } = await buildBentoHtml(it.doc, it.baseName);
+      const fd = new FormData();
+      fd.append('bento_save_html', html);
+      fd.append('bento_filename', filename);
+      fd.append('bento_kind', 'deck');
+      const resp = await fetch('', { method: 'POST', body: fd });
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) throw new Error(data.error || ('Serverfehler (' + resp.status + ')'));
+      resultBox.style.display = 'block';
+      resultBox.innerHTML =
+        '✅ Bearbeitbar auf dem Server gespeichert. Von hier aus jederzeit weiter bearbeiten - der ' +
+        '„Speichern"-Knopf im Editor selbst schreibt direkt wieder in diese Datei zurück:<br>' +
+        '<a href="' + esc(data.url) + '" target="_blank" rel="noopener" style="display:inline-block; margin-top:6px; color:#93c5fd;">✏️ Zum Bearbeiten öffnen</a>';
+      toast('Bearbeitbar gespeichert ✓');
+    } catch(e){
+      console.error(e);
+      resultBox.style.display = 'block';
+      resultBox.style.background = '#2a0f0f';
+      resultBox.style.borderColor = '#6b1f1f';
+      resultBox.style.color = '#fecaca';
+      resultBox.textContent = 'Fehler beim Speichern: ' + (e.message || e);
+    } finally {
+      saveDeckBtn.disabled = false;
+      saveDeckBtn.classList.remove('busy');
     }
   });
 
   const openBtn = card.querySelector('[data-action="open"]');
   openBtn.addEventListener('click', () => {
-    const original = openBtn.textContent;
     // Open the tab SYNCHRONOUSLY, in direct response to the click — once
     // an `await` happens first, some browsers no longer treat the later
     // window.open() as user-initiated and silently block it.
@@ -1204,7 +2321,7 @@ function buildItemCard(it){
       '<body style="font-family:system-ui,sans-serif;padding:2.5rem;color:#667">Bento wird geladen…</body>'
     );
     openBtn.disabled = true;
-    openBtn.textContent = 'Lade Bento-App…';
+    openBtn.classList.add('busy');
     (async () => {
       try{
         const { html } = await buildBentoHtml(it.doc, it.baseName);
@@ -1231,7 +2348,7 @@ function buildItemCard(it){
         note.textContent = 'Konnte die Bento-App nicht laden (' + (e.message || e) + ').';
       } finally {
         openBtn.disabled = false;
-        openBtn.textContent = original;
+        openBtn.classList.remove('busy');
       }
     })();
   });
@@ -1260,6 +2377,24 @@ function buildItemCard(it){
     items.splice(above ? targetIdx : targetIdx + 1, 0, draggedItem);
     renderItems();
   });
+
+  const shrinkBtn = card.querySelector('[data-action="shrink"]');
+  shrinkBtn.addEventListener('click', () => {
+    openShrinkAssetsModal(it, () => { renderItems(); toast('Medien verkleinert — noch nicht gespeichert.'); });
+  });
+
+  const splitBtn = card.querySelector('[data-action="split"]');
+  if (splitBtn){
+    splitBtn.addEventListener('click', () => {
+      openSplitModal(it, (newItems) => {
+        const i = items.indexOf(it);
+        if (i >= 0) items.splice(i, 1, ...newItems);
+        else items.push(...newItems);
+        renderItems();
+        toast('In ' + newItems.length + ' Teile aufgeteilt — noch nicht gespeichert.');
+      });
+    });
+  }
 
   return card;
 }
