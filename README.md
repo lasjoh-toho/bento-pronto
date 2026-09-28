@@ -1,6 +1,8 @@
 # bento-pronto
 
-A self-hostable, **single PHP file** version of the [bento-moodle-tools](https://github.com/lasjoh-toho/bento-moodle-tools) PPTX→Bento converter — same four options (Demo, neue Präsentation, Import, Inhalte auf Folien verteilen), but running as real PHP instead of a static page.
+A self-hostable, **single PHP file** version of the [bento-moodle-tools](https://github.com/lasjoh-toho/bento-moodle-tools) PPTX/PPT→Bento converter — same four options (Demo, neue Präsentation, Import, Inhalte auf Folien verteilen), but running as real PHP instead of a static page.
+
+**Import** handles both `.pptx` and old binary `.ppt` (PowerPoint 97–2003) directly in the browser — texts with master-style/bullet inheritance, shapes incl. freeform geometry, pictures with alt text, colours/theme colours, gradients, backgrounds, tables, charts, click animations, transitions and speaker notes. The PPTX/PPT reader itself (the OLE2/CFB container reader and MS-PPT/MS-ODRAW record parser for the legacy format) is ported from [moodle-mod_bento](https://github.com/lasjoh-toho/moodle-mod_bento)'s own `bentoconvert.js` — keep the two in sync when either gets improved.
 
 **Why this exists:** the static converter is fully offline and free to host (GitHub Pages), but that means it *structurally cannot* run a server-side component — so its "Inhalte auf Folien verteilen" (paste) feature can only embed an image from copied HTML when the source server happens to allow cross-origin reads (CORS), which most sites don't. bento-pronto solves that by running as PHP: the same file that serves the converter also runs a built-in image proxy (`?proxy=<url>`), fetching images server-side — a browser's CORS restriction only ever applied to a *script's own* cross-origin read, never to server-to-server requests — so images always come through here, no configuration, no separate service to run.
 
